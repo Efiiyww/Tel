@@ -2,24 +2,33 @@ import logging
 import os
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters,
-    ContextTypes, ConversationHandler
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler
 )
 
 # ================== تنظیمات ==================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
-if not BOT_TOKEN or ADMIN_ID == 0:
-    raise RuntimeError("BOT_TOKEN و ADMIN_ID باید در Environment تنظیم شوند")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN تنظیم نشده است")
+
+if ADMIN_ID == 0:
+    raise RuntimeError("ADMIN_ID تنظیم نشده است")
 
 # ================== وضعیت‌ها ==================
 MAIN_MENU, WAITING_GENDER, IN_CHAT = range(3)
 
-# صف‌ها و وضعیت کاربران
+# صف‌ها
 random_queue = []
 girl_queue = []
 boy_queue = []
+
+# کاربرهایی که به هم وصل شده‌اند
 partners = {}  # {user_id: partner_id}
 
 logging.basicConfig(
@@ -30,24 +39,27 @@ logger = logging.getLogger(__name__)
 
 # ================== کیبوردها ==================
 def main_keyboard():
-    return ReplyKeyboardMarkup([
+    keyboard = [
         [KeyboardButton("به یک ناشناس وصلم کن")],
         [KeyboardButton("به مخاطب خاص وصلم کن")],
         [KeyboardButton("لینک ناشناس من"), KeyboardButton("راهنما")],
-    ], resize_keyboard=True)
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def gender_keyboard():
-    return ReplyKeyboardMarkup([
+    keyboard = [
         [KeyboardButton("دختر 👩"), KeyboardButton("پسر 👨")],
         [KeyboardButton("بازگشت به منو")],
-    ], resize_keyboard=True)
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def chat_keyboard():
-    return ReplyKeyboardMarkup([
+    keyboard = [
         [KeyboardButton("قطع ارتباط ❌")],
-    ], resize_keyboard=True)
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-# ================== تابع قوی اطلاع به ادمین ==================
+# ================== ارسال قوی به ادمین ==================
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str):
     """ارسال پیام به ادمین با لاگ کامل"""
     try:
@@ -58,7 +70,7 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str):
         )
         logger.info("✅ پیام با موفقیت به ادمین ارسال شد")
     except Exception as e:
-        logger.error(f"❌ خطا در ارسال به ادمین (ADMIN_ID={ADMIN_ID}): {e}")
+        logger.error(f"❌ خطا در ارسال به ادمین | ADMIN_ID={ADMIN_ID} | Error={e}")
 
 def remove_from_queues(user_id: int):
     for q in (random_queue, girl_queue, boy_queue):
@@ -70,7 +82,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args
 
-    # پیام ناشناس یک‌طرفه
+    # اگر از طریق لینک ناشناس وارد شده
     if args:
         try:
             target_id = int(args[0])
@@ -80,7 +92,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             context.user_data["anonymous_target"] = target_id
             await update.message.reply_text(
-                "✉️ پیام ناشناس خود را بنویسید:\n(پیام شما به صورت ناشناس ارسال می‌شود)",
+                "✉️ پیام ناشناس خود را بنویسید:\n\nپیام شما به صورت ناشناس ارسال می‌شود.",
                 reply_markup=ReplyKeyboardRemove()
             )
             return ConversationHandler.END
@@ -89,7 +101,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"سلام {user.first_name} 👋\n\n"
-        "به ربات چت ناشناس خوش آمدی!\nاز دکمه‌های زیر استفاده کن:",
+        "به ربات چت ناشناس خوش آمدی!\n"
+        "از دکمه‌های زیر استفاده کن:",
         reply_markup=main_keyboard()
     )
     return MAIN_MENU
@@ -97,10 +110,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📖 **راهنمای ربات**\n\n"
-        "🔹 **به یک ناشناس وصلم کن** → رندوم به یک نفر وصل می‌شوی\n"
-        "🔹 **به مخاطب خاص وصلم کن** → جنسیت انتخاب می‌کنی و وصل می‌شوی\n"
-        "🔹 **لینک ناشناس من** → لینک اختصاصی خودت را بگیر\n"
-        "🔹 برای قطع چت از دکمه «قطع ارتباط ❌» استفاده کن"
+        "🔹 **به یک ناشناس وصلم کن**\n"
+        "رندوم به یک نفر وصل می‌شوی.\n\n"
+        "🔹 **به مخاطب خاص وصلم کن**\n"
+        "جنسیت را انتخاب می‌کنی و به همان جنسیت وصل می‌شوی.\n\n"
+        "🔹 **لینک ناشناس من**\n"
+        "لینک اختصاصی خودت را می‌گیری.\n\n"
+        "🔹 برای قطع چت از دکمه «قطع ارتباط ❌» استفاده کن."
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard())
     return MAIN_MENU
@@ -137,10 +153,12 @@ async def connect_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(partner_id, msg, reply_markup=chat_keyboard())
         await update.message.reply_text(msg, reply_markup=chat_keyboard())
 
-        await notify_admin(context,
+        await notify_admin(
+            context,
             f"🔗 **اتصال رندوم جدید**\n"
             f"کاربر ۱: `{user_id}`\n"
-            f"کاربر ۲: `{partner_id}`")
+            f"کاربر ۲: `{partner_id}`"
+        )
         return IN_CHAT
     else:
         random_queue.append(user_id)
@@ -196,13 +214,13 @@ async def gender_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⏳ در حال جستجو برای یک {gender_name}...\nلطفاً صبر کن.", reply_markup=ReplyKeyboardRemove())
         return MAIN_MENU
 
-# ================== مدیریت پیام‌ها در چت ==================
+# ================== مدیریت پیام‌ها ==================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
     message = update.message
 
-    # اگر در صف منتظر است
+    # اگر هنوز در صف منتظر است
     if user_id in random_queue or user_id in girl_queue or user_id in boy_queue:
         await update.message.reply_text("هنوز کسی پیدا نشده. لطفاً صبر کن یا /start بزن.")
         return MAIN_MENU
@@ -229,7 +247,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await context.bot.send_message(partner_id, "👤 ناشناس یک پیام رسانه‌ای فرستاد")
 
-            # ========== اطلاع کامل به ادمین ==========
+            # ========== ارسال کامل اطلاعات به ادمین ==========
             admin_text = (
                 f"💬 **پیام در چت ناشناس**\n\n"
                 f"از: `{user_id}`\n"
