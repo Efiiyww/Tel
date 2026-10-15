@@ -14,15 +14,15 @@ if not BOT_TOKEN or ADMIN_ID == 0:
     raise RuntimeError("BOT_TOKEN و ADMIN_ID باید تنظیم شوند")
 
 # ================== وضعیت‌ها ==================
-MAIN_MENU, WAITING_GENDER, IN_CHAT, WAITING_ADMIN_REPLY = range(4)
+MAIN_MENU, WAITING_GENDER, IN_CHAT = range(3)
 
 # داده‌ها
 random_queue = []
 girl_queue = []
 boy_queue = []
 partners = {}
-blocked_users = set()          # کاربران بلاک‌شده
-admin_reply_target = {}        # {admin_id: target_user_id}
+blocked_users = set()
+admin_reply_target = {}   # {admin_id: target_user_id}
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -45,16 +45,13 @@ def chat_keyboard():
     return ReplyKeyboardMarkup([[KeyboardButton("قطع ارتباط ❌")]], resize_keyboard=True)
 
 def admin_buttons(user_id: int):
-    """دکمه‌های شیشه‌ای برای ادمین"""
-    keyboard = [
-        [
-            InlineKeyboardButton("💬 پاسخ دادن", callback_data=f"reply_{user_id}"),
-            InlineKeyboardButton("🚫 بلاک کردن", callback_data=f"block_{user_id}")
-        ]
-    ]
+    keyboard = [[
+        InlineKeyboardButton("💬 پاسخ دادن", callback_data=f"reply_{user_id}"),
+        InlineKeyboardButton("🚫 بلاک کردن", callback_data=f"block_{user_id}")
+    ]]
     return InlineKeyboardMarkup(keyboard)
 
-# ================== اطلاع به ادمین با دکمه ==================
+# ================== اطلاع به ادمین ==================
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str, user_id: int = None):
     try:
         if user_id:
@@ -65,11 +62,7 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str, user_id: i
                 reply_markup=admin_buttons(user_id)
             )
         else:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=text,
-                parse_mode="Markdown"
-            )
+            await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="Markdown")
         logger.info("✅ پیام به ادمین ارسال شد")
     except Exception as e:
         logger.error(f"❌ خطا در ارسال به ادمین: {e}")
@@ -79,7 +72,7 @@ def remove_from_queues(user_id: int):
         if user_id in q:
             q.remove(user_id)
 
-# ================== دستورات ==================
+# ================== دستورات اصلی ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args
@@ -95,10 +88,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("نمی‌توانی به خودت پیام ناشناس بفرستی!")
                 return MAIN_MENU
             context.user_data["anonymous_target"] = target_id
-            await update.message.reply_text(
-                "✉️ پیام ناشناس خود را بنویسید:",
-                reply_markup=ReplyKeyboardRemove()
-            )
+            await update.message.reply_text("✉️ پیام ناشناس خود را بنویسید:", reply_markup=ReplyKeyboardRemove())
             return ConversationHandler.END
         except:
             pass
@@ -124,11 +114,7 @@ async def my_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     bot = await context.bot.get_me()
     link = f"https://t.me/{bot.username}?start={user.id}"
-    await update.message.reply_text(
-        f"🔗 **لینک ناشناس شما:**\n\n`{link}`",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard()
-    )
+    await update.message.reply_text(f"🔗 **لینک ناشناس شما:**\n\n`{link}`", parse_mode="Markdown", reply_markup=main_keyboard())
     return MAIN_MENU
 
 # ================== اتصال‌ها ==================
@@ -199,6 +185,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     message = update.message
 
+    # اگر ادمین در حال پاسخ دادن است
+    if user_id == ADMIN_ID and user_id in admin_reply_target:
+        target_id = admin_reply_target.pop(user_id)
+        try:
+            await context.bot.send_message(
+                target_id,
+                f"💬 **پاسخ ناشناس:**\n\n{message.text}",
+                parse_mode="Markdown"
+            )
+            await update.message.reply_text("✅ پیام ارسال شد")
+            await notify_admin(context, f"✅ ادمین به `{target_id}` پاسخ داد:\n{message.text}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ خطا در ارسال پاسخ: {e}")
+        return MAIN_MENU
+
     if user_id in blocked_users:
         await update.message.reply_text("شما توسط ادمین بلاک شده‌اید.")
         return MAIN_MENU
@@ -226,7 +227,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await context.bot.send_message(partner_id, "👤 ناشناس پیام رسانه‌ای فرستاد")
 
-            # اطلاع به ادمین با دکمه
             admin_text = (
                 f"💬 **پیام در چت**\n\n"
                 f"از: `{user_id}`\n"
@@ -287,13 +287,12 @@ async def anonymous_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"متن: {text}"
         )
         await notify_admin(context, admin_text, user_id=user.id)
-
     except Exception as e:
         logger.error(e)
         await update.message.reply_text("❌ خطا در ارسال.")
     context.user_data.pop("anonymous_target", None)
 
-# ================== دکمه‌های ادمین (پاسخ و بلاک) ==================
+# ================== دکمه‌های ادمین ==================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -301,19 +300,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_id = query.from_user.id
 
     if admin_id != ADMIN_ID:
-        await query.edit_message_text("فقط ادمین می‌تواند از این دکمه‌ها استفاده کند.")
+        await query.answer("فقط ادمین می‌تواند استفاده کند.", show_alert=True)
         return
 
     if data.startswith("reply_"):
         target_id = int(data.split("_")[1])
         admin_reply_target[admin_id] = target_id
-        await query.edit_message_text(f"💬 در حال پاسخ به کاربر `{target_id}`\n\nمتن پاسخ خود را بنویسید:", parse_mode="Markdown")
-        return WAITING_ADMIN_REPLY
+        await query.edit_message_text(
+            f"💬 در حال پاسخ به کاربر `{target_id}`\n\n"
+            f"الان متن پاسخ خود را بنویسید:",
+            parse_mode="Markdown"
+        )
+        # مهم: وضعیت را نگه می‌داریم تا پیام بعدی ادمین به عنوان پاسخ در نظر گرفته شود
 
     elif data.startswith("block_"):
         target_id = int(data.split("_")[1])
         blocked_users.add(target_id)
-        # اگر در چت بود قطع کن
         if target_id in partners:
             partner = partners.pop(target_id)
             if partner in partners:
@@ -324,27 +326,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         remove_from_queues(target_id)
         await query.edit_message_text(f"🚫 کاربر `{target_id}` بلاک شد.", parse_mode="Markdown")
-        await notify_admin(context, f"🚫 کاربر `{target_id}` توسط ادمین بلاک شد.")
-
-async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_id = update.effective_user.id
-    if admin_id != ADMIN_ID:
-        return
-
-    target_id = admin_reply_target.get(admin_id)
-    if not target_id:
-        await update.message.reply_text("هدفی برای پاسخ وجود ندارد.")
-        return MAIN_MENU
-
-    try:
-        await context.bot.send_message(target_id, f"💬 **پاسخ ناشناس از طرف گیرنده:**\n\n{update.message.text}", parse_mode="Markdown")
-        await update.message.reply_text("✅ پاسخ ارسال شد.")
-        await notify_admin(context, f"✅ ادمین به کاربر `{target_id}` پاسخ داد:\n{update.message.text}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در ارسال پاسخ: {e}")
-
-    admin_reply_target.pop(admin_id, None)
-    return MAIN_MENU
 
 # ================== اصلی ==================
 def main():
@@ -367,9 +348,6 @@ def main():
                 MessageHandler(filters.Regex("^قطع ارتباط ❌$"), stop_chat),
                 MessageHandler(filters.ALL & ~filters.COMMAND, handle_message),
             ],
-            WAITING_ADMIN_REPLY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_reply),
-            ],
         },
         fallbacks=[
             CommandHandler("start", start),
@@ -382,6 +360,8 @@ def main():
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, anonymous_message))
+    # این خط مهم است تا پیام‌های ادمین هم گرفته شود
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("ربات با قابلیت پاسخ و بلاک شروع شد...")
     app.run_polling()
