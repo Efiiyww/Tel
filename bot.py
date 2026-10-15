@@ -31,7 +31,7 @@ from telegram import (
     User,
 )
 from telegram.constants import ParseMode
-from telegram.error import Forbidden, TelegramError
+from telegram.error import Conflict, Forbidden, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -821,6 +821,10 @@ async def on_edited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ============================== خطاگیر سراسری ==============================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, Conflict):
+        # دو نمونه از ربات با یک توکن در حال اجراست؛ فقط لاگ می‌شود تا ادمین اسپم نشود
+        logger.error("Conflict: نمونه‌ی دیگری از ربات با همین توکن در حال اجراست.")
+        return
     logger.error("Unhandled exception", exc_info=context.error)
     try:
         await context.bot.send_message(
