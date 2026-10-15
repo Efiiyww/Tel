@@ -16,6 +16,7 @@ import html
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -231,18 +232,22 @@ async def notify_admin(
     text: str,
     markup: Optional[InlineKeyboardMarkup] = None,
 ) -> Optional[Message]:
+    kb = markup if markup and markup.inline_keyboard else None
     try:
-        msg = await context.bot.send_message(
-            ADMIN_ID,
-            text[:4000],
-            parse_mode=ParseMode.HTML,
-            reply_markup=markup if markup and markup.inline_keyboard else None,
-            disable_web_page_preview=True,
+        return await context.bot.send_message(
+            ADMIN_ID, text[:4000], parse_mode=ParseMode.HTML, reply_markup=kb
         )
-        return msg
     except Exception as e:  # noqa: BLE001
-        logger.error("خطا در ارسال به ادمین: %s", e)
-        return None
+        logger.error("خطا در ارسال HTML به ادمین: %s", e)
+        try:  # تلاش دوباره بدون فرمت تا پیام هرگز گم نشود
+            plain = html.unescape(re.sub(r"<[^>]+>", "", text))
+            return await context.bot.send_message(ADMIN_ID, plain[:4000], reply_markup=kb)
+        except Exception as e2:  # noqa: BLE001
+            logger.error("خطا در ارسال به ادمین: %s", e2)
+            return None
+
+
+_report_lock: Optional[asyncio.Lock] = None
 
 
 async def report_message(
@@ -251,31 +256,44 @@ async def report_message(
     sender: int,
     receiver: int,
     title: str,
+    delivered: bool = True,
 ) -> None:
-    """گزارش کامل یک پیام (متن یا رسانه) به همراه اطلاعات فرستنده و گیرنده."""
+    """
+    گزارش پیام برای ادمین در دو پیام پشت‌سرهم:
+      ۱) پیام اطلاعات (بدون دکمه) شامل فرستنده/گیرنده/زمان
+      ۲) خودِ پیام اصلی (متن یا رسانه) همراه با دکمه‌های پاسخ و بلاک
+    """
+    global _report_lock
     if sender == ADMIN_ID:
         return
-    body = (
+    if _report_lock is None:
+        _report_lock = asyncio.Lock()
+
+    status = "" if delivered else "\n⚠️ <b>ارسال به گیرنده ناموفق بود</b>"
+    info = (
         f"<b>{title}</b>\n\n"
         f"👤 از: {user_tag(sender)}\n"
         f"🎯 به: {user_tag(receiver)}\n"
-        f"🕒 {now_str()}\n\n"
+        f"🕒 {now_str()}{status}"
     )
-    if message.text:
-        body += f"<b>متن:</b>\n{esc(message.text)}"
-    else:
-        body += f"<b>نوع:</b> {media_name(message)}"
-        if message.caption:
-            body += f"\n<b>کپشن:</b> {esc(message.caption)}"
-    sent = await notify_admin(context, body, admin_markup(sender, receiver))
-    if sent and not message.text:
+    markup = admin_markup(sender, receiver)
+
+    async with _report_lock:  # تا پیام‌های چند چت با هم قاطی نشوند
+        await notify_admin(context, info)
         try:
-            await context.bot.copy_message(
-                ADMIN_ID, message.chat_id, message.message_id,
-                reply_to_message_id=sent.message_id,
+            if message.text:
+                await context.bot.send_message(ADMIN_ID, message.text, reply_markup=markup)
+            else:
+                await context.bot.copy_message(
+                    ADMIN_ID, message.chat_id, message.message_id, reply_markup=markup
+                )
+        except TelegramError as e:
+            logger.error("خطا در ارسال محتوای پیام به ادمین: %s", e)
+            await notify_admin(
+                context,
+                f"⚠️ محتوا ({media_name(message)}) قابل کپی نبود.",
+                markup,
             )
-        except Exception as e:  # noqa: BLE001
-            logger.error("خطا در کپی رسانه برای ادمین: %s", e)
 
 
 # ============================== ارسال پیام ناشناس ==============================
@@ -375,7 +393,6 @@ async def start_search(
     await notify_admin(
         context,
         f"🔗 <b>{kind}</b>\n\n👤 {user_tag(uid)}\n↔️ {user_tag(pid)}\n🕒 {now_str()}",
-        admin_markup(uid, pid),
     )
 
 
@@ -408,7 +425,6 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             context,
             f"🆕 <b>کاربر جدید</b>\n\n{user_tag(user.id)}\n🕒 {now_str()}\n"
             f"👥 تعداد کل کاربران: {len(store.users)}",
-            admin_markup(user.id),
         )
 
 
@@ -498,7 +514,6 @@ async def stop_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             context,
             f"❌ <b>قطع ارتباط</b>\n\nتوسط: {user_tag(uid)}\nطرف مقابل: {user_tag(partner)}\n"
             f"🕒 {now_str()}",
-            admin_markup(uid, partner),
         )
     elif in_queue(uid):
         remove_from_queue(uid)
@@ -683,18 +698,22 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await stop_chat(update, context)
             return
         partner = partners[uid]
+        error = None
         try:
             await deliver(context, msg, partner, "👤 ناشناس")
         except Forbidden:
+            error = "forbidden"
+        except TelegramError as e:
+            logger.error("خطا در ارسال پیام چت: %s", e)
+            error = "other"
+        await report_message(context, msg, uid, partner, "💬 پیام در چت",
+                             delivered=error is None)
+        if error == "forbidden":
             await disconnect(context, uid, "❌ ارتباط قطع شد.")
             await msg.reply_text("طرف مقابل در دسترس نیست؛ ارتباط قطع شد.",
                                  reply_markup=main_keyboard())
-            return
-        except TelegramError as e:
-            logger.error("خطا در ارسال پیام چت: %s", e)
+        elif error:
             await msg.reply_text("❌ خطا در ارسال پیام.")
-            return
-        await report_message(context, msg, uid, partner, "💬 پیام در چت")
         return
 
     # --- ۳) در صف انتظار ---
@@ -716,19 +735,22 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await msg.reply_text("لغو شد.", reply_markup=main_keyboard())
             return
         target = context.user_data.get("anon_target")
+        error = None
         try:
             await deliver(context, msg, target, "📩 پیام ناشناس")
         except TelegramError as e:
             logger.error("خطا در ارسال پیام ناشناس: %s", e)
-            context.user_data.clear()
+            error = e
+        context.user_data.clear()
+        await report_message(context, msg, uid, target, "📩 پیام ناشناس یک‌طرفه",
+                             delivered=error is None)
+        if error:
             await msg.reply_text(
                 "❌ ارسال ناموفق بود (گیرنده پیدا نشد یا ربات را بلاک کرده است).",
                 reply_markup=main_keyboard(),
             )
-            return
-        context.user_data.clear()
-        await msg.reply_text("✅ پیام ارسال شد.", reply_markup=main_keyboard())
-        await report_message(context, msg, uid, target, "📩 پیام ناشناس یک‌طرفه")
+        else:
+            await msg.reply_text("✅ پیام ارسال شد.", reply_markup=main_keyboard())
         return
 
     # --- ۵) انتخاب جنسیت ---
@@ -778,6 +800,25 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await msg.reply_text("از دکمه‌های منو استفاده کن.", reply_markup=main_keyboard())
 
 
+# ============================== پیام‌های ویرایش‌شده ==============================
+async def on_edited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.edited_message
+    user = update.effective_user
+    if not msg or not user or is_blocked(user.id):
+        return
+    partner = partners.get(user.id)
+    if not partner:
+        return
+    delivered = True
+    if msg.text:  # ویرایش متن برای طرف مقابل هم ارسال می‌شود
+        try:
+            await deliver(context, msg, partner, "✏️ ناشناس (ویرایش شد)")
+        except TelegramError:
+            delivered = False
+    await report_message(context, msg, user.id, partner, "✏️ ویرایش پیام در چت",
+                         delivered=delivered)
+
+
 # ============================== خطاگیر سراسری ==============================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled exception", exc_info=context.error)
@@ -819,8 +860,14 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(reply|block|unblock)_\d+$"))
     app.add_handler(
         MessageHandler(
-            filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
+            filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE
+            & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
             on_message,
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.UpdateType.EDITED_MESSAGE, on_edited
         )
     )
     app.add_error_handler(on_error)
