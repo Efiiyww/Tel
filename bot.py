@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import secrets
 from datetime import datetime
 from typing import Optional
 
@@ -77,13 +78,18 @@ CAPTION_TYPES = ("photo", "video", "document", "audio", "voice", "animation")
 
 # ============================== ذخیره‌سازی ==============================
 class Store:
-    """ذخیره‌ی پایدار کاربران، بلاک‌شده‌ها و جنسیت‌ها در یک فایل JSON."""
+    """ذخیره‌ی پایدار کاربران، بلاک‌ها، جنسیت‌ها و رشته‌های پیام ناشناس در JSON."""
+
+    MAX_THREADS = 20000
 
     def __init__(self, path: str):
         self.path = path
         self.users: dict[int, dict] = {}
-        self.blocked: set[int] = set()
+        self.blocked: set[int] = set()                 # بلاک‌شده‌های ادمین (سراسری)
         self.genders: dict[int, str] = {}
+        self.user_blocks: dict[int, set[int]] = {}     # {گیرنده: {فرستنده‌های بلاک‌شده}}
+        self.threads: dict[str, list[int]] = {}        # {token: [فرستنده, گیرنده]}
+        self._thread_index: dict[tuple[int, int], str] = {}
         self._load()
 
     def _load(self) -> None:
@@ -95,6 +101,11 @@ class Store:
             self.users = {int(k): v for k, v in data.get("users", {}).items()}
             self.blocked = {int(x) for x in data.get("blocked", [])}
             self.genders = {int(k): v for k, v in data.get("genders", {}).items()}
+            self.user_blocks = {
+                int(k): {int(x) for x in v} for k, v in data.get("user_blocks", {}).items()
+            }
+            self.threads = {k: [int(v[0]), int(v[1])] for k, v in data.get("threads", {}).items()}
+            self._thread_index = {(v[0], v[1]): k for k, v in self.threads.items()}
         except Exception as e:  # noqa: BLE001
             logger.error("خطا در خواندن فایل داده: %s", e)
 
@@ -107,6 +118,8 @@ class Store:
                         "users": self.users,
                         "blocked": sorted(self.blocked),
                         "genders": self.genders,
+                        "user_blocks": {str(k): sorted(v) for k, v in self.user_blocks.items()},
+                        "threads": self.threads,
                     },
                     f,
                     ensure_ascii=False,
@@ -114,6 +127,28 @@ class Store:
             os.replace(tmp, self.path)
         except Exception as e:  # noqa: BLE001
             logger.error("خطا در ذخیره‌ی فایل داده: %s", e)
+
+    # ---- رشته‌های پیام ناشناس: توکن مبهم به‌جای افشای آیدی فرستنده ----
+    def thread_token(self, sender: int, receiver: int) -> str:
+        key = (sender, receiver)
+        token = self._thread_index.get(key)
+        if token:
+            return token
+        token = secrets.token_hex(6)
+        self.threads[token] = [sender, receiver]
+        self._thread_index[key] = token
+        while len(self.threads) > self.MAX_THREADS:
+            old_token = next(iter(self.threads))
+            o = self.threads.pop(old_token)
+            self._thread_index.pop((o[0], o[1]), None)
+        self.save()
+        return token
+
+    def has_blocked(self, receiver: int, sender: int) -> bool:
+        return sender in self.user_blocks.get(receiver, set())
+
+    def blocked_each_other(self, a: int, b: int) -> bool:
+        return self.has_blocked(a, b) or self.has_blocked(b, a)
 
 
 store = Store(DATA_FILE)
@@ -226,6 +261,17 @@ def admin_markup(*user_ids: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def user_markup(token: str, allow_block: bool = True, blocked: bool = False) -> InlineKeyboardMarkup:
+    """دکمه‌های پاسخ/بلاک زیر هر پیام ناشناس دریافتی (بدون افشای هویت فرستنده)."""
+    row = [InlineKeyboardButton("💬 پاسخ", callback_data=f"ur_{token}")]
+    if allow_block:
+        if blocked:
+            row.append(InlineKeyboardButton("✅ آنبلاک", callback_data=f"uu_{token}"))
+        else:
+            row.append(InlineKeyboardButton("🚫 بلاک", callback_data=f"ub_{token}"))
+    return InlineKeyboardMarkup([row])
+
+
 # ============================== ارتباط با ادمین ==============================
 async def notify_admin(
     context: ContextTypes.DEFAULT_TYPE,
@@ -298,20 +344,73 @@ async def report_message(
 
 # ============================== ارسال پیام ناشناس ==============================
 async def deliver(
-    context: ContextTypes.DEFAULT_TYPE, message: Message, to_id: int, label: str
+    context: ContextTypes.DEFAULT_TYPE,
+    message: Message,
+    to_id: int,
+    label: str,
+    markup: Optional[InlineKeyboardMarkup] = None,
 ) -> None:
-    """ارسال هر نوع پیام به مقصد بدون افشای فرستنده."""
+    """ارسال هر نوع پیام به مقصد بدون افشای فرستنده؛ دکمه‌ها (اختیاری) روی خودِ پیام."""
     if message.text:
-        await context.bot.send_message(to_id, f"{label}:\n{message.text}")
+        await context.bot.send_message(
+            to_id, f"{label}:\n{message.text}", reply_markup=markup
+        )
         return
     if any(getattr(message, a, None) for a in CAPTION_TYPES):
         caption = label + (f"\n{message.caption}" if message.caption else "")
         await context.bot.copy_message(
-            to_id, message.chat_id, message.message_id, caption=caption[:1024]
+            to_id, message.chat_id, message.message_id,
+            caption=caption[:1024], reply_markup=markup,
         )
         return
+    # استیکر، ویدیو مسیج، لوکیشن و ...: برچسب جدا + خودِ پیام با دکمه‌ها
     await context.bot.send_message(to_id, f"{label}:")
-    await context.bot.copy_message(to_id, message.chat_id, message.message_id)
+    await context.bot.copy_message(
+        to_id, message.chat_id, message.message_id, reply_markup=markup
+    )
+
+
+async def send_anonymous(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    target: int,
+    label: str,
+    title: str,
+) -> None:
+    """
+    ارسال پیام ناشناس یک‌طرفه یا پاسخ به گیرنده، همراه با دکمه‌ی پاسخ/بلاک برای گیرنده.
+    اگر گیرنده ادمین باشد، پیام مستقیم در گزارش ادمین (با دکمه‌های ادمین) نمایش داده می‌شود.
+    """
+    msg = update.effective_message
+    uid = update.effective_user.id
+    context.user_data.clear()
+
+    if not target or target in store.blocked:
+        await msg.reply_text("❌ گیرنده در دسترس نیست.", reply_markup=main_keyboard())
+        return
+    if target != ADMIN_ID and uid != ADMIN_ID and store.has_blocked(target, uid):
+        await msg.reply_text("❌ گیرنده شما را مسدود کرده است.", reply_markup=main_keyboard())
+        return
+
+    error = None
+    if target != ADMIN_ID:
+        token = store.thread_token(uid, target)
+        markup = user_markup(token, allow_block=uid != ADMIN_ID)
+        try:
+            await deliver(context, msg, target, label, markup)
+        except TelegramError as e:
+            logger.error("خطا در ارسال پیام ناشناس: %s", e)
+            error = e
+
+    await report_message(context, msg, uid, target, title, delivered=error is None)
+
+    if error:
+        await msg.reply_text(
+            "❌ ارسال ناموفق بود (گیرنده پیدا نشد یا ربات را بلاک کرده است).",
+            reply_markup=main_keyboard(),
+        )
+    else:
+        await msg.reply_text("✅ پیام ارسال شد.", reply_markup=main_keyboard())
 
 
 # ============================== مدیریت اتصال ==============================
@@ -338,6 +437,8 @@ def find_match(uid: int, gender: Optional[str], wants: Optional[str]) -> Optiona
             continue
         if cid in partners or cid in store.blocked:
             waiting.remove(e)  # ورودی‌های کهنه
+            continue
+        if store.blocked_each_other(uid, cid):
             continue
         if wants and e["gender"] != wants:
             continue
@@ -456,6 +557,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
             context.user_data["state"] = "anon"
             context.user_data["anon_target"] = target
+            context.user_data["anon_kind"] = "new"
             await msg.reply_text("✉️ پیام ناشناس خود را بنویسید (متن یا رسانه):",
                                  reply_markup=anon_keyboard())
             return
@@ -475,7 +577,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🔹 لینک ناشناس من → لینک اختصاصی برای دریافت پیام ناشناس\n"
         "🔹 قطع ارتباط → با دکمه‌ی مخصوص یا دستور /stop\n"
         "🔹 تغییر جنسیت خودت → /gender\n"
-        "🔹 انصراف از هر مرحله → /cancel",
+        "🔹 انصراف از هر مرحله → /cancel\n"
+        "🔹 زیر هر پیام ناشناس دریافتی می‌توانی پاسخ بدهی یا فرستنده را بلاک کنی\n"
+        "🔹 خارج کردن همه از بلاک → /unblockall",
         reply_markup=main_keyboard() if update.effective_user.id not in partners
         else chat_keyboard(),
     )
@@ -668,6 +772,66 @@ def _refresh_markup(q) -> InlineKeyboardMarkup:
     return admin_markup(*ids)
 
 
+# ============================== دکمه‌های کاربران عادی ==============================
+async def on_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    action, token = q.data.split("_", 1)
+    thread = store.threads.get(token)
+
+    if not thread:
+        await q.answer("این پیام منقضی شده است.", show_alert=True)
+        return
+    sender, receiver = thread
+    if uid != receiver:
+        await q.answer("این دکمه برای شما نیست.", show_alert=True)
+        return
+    if is_blocked(uid):
+        await q.answer("شما توسط ادمین بلاک شده‌اید.", show_alert=True)
+        return
+
+    if action == "ur":  # پاسخ
+        if uid in partners or in_queue(uid):
+            await q.answer("ابتدا چت یا جستجوی فعلی را پایان بده.", show_alert=True)
+            return
+        context.user_data.clear()
+        context.user_data.update(state="anon", anon_target=sender, anon_kind="reply")
+        await q.answer()
+        await context.bot.send_message(
+            uid, "✉️ پاسخ خود را بنویسید (متن یا رسانه):", reply_markup=anon_keyboard()
+        )
+    elif action == "ub":  # بلاک فرستنده
+        if sender == ADMIN_ID:
+            await q.answer("امکان بلاک این فرستنده وجود ندارد.", show_alert=True)
+            return
+        store.user_blocks.setdefault(uid, set()).add(sender)
+        store.save()
+        await q.answer("🚫 فرستنده بلاک شد؛ دیگر نمی‌تواند به تو پیام بدهد.", show_alert=True)
+        try:
+            await q.edit_message_reply_markup(reply_markup=user_markup(token, blocked=True))
+        except TelegramError:
+            pass
+    elif action == "uu":  # آنبلاک فرستنده
+        store.user_blocks.get(uid, set()).discard(sender)
+        store.save()
+        await q.answer("✅ آنبلاک شد.")
+        try:
+            await q.edit_message_reply_markup(reply_markup=user_markup(token))
+        except TelegramError:
+            pass
+
+
+async def cmd_unblockall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await register(update, context)
+    uid = update.effective_user.id
+    count = len(store.user_blocks.pop(uid, set()))
+    store.save()
+    await update.effective_message.reply_text(
+        f"✅ {count} فرستنده از لیست بلاک شما خارج شد." if count else "لیست بلاک شما خالی است.",
+        reply_markup=main_keyboard() if uid not in partners else chat_keyboard(),
+    )
+
+
 # ============================== مسیریاب اصلی پیام‌ها ==============================
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
@@ -686,7 +850,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if uid == ADMIN_ID and uid in admin_reply_target:
         target = admin_reply_target.pop(uid)
         try:
-            await deliver(context, msg, target, "💬 پاسخ ناشناس")
+            token = store.thread_token(ADMIN_ID, target)
+            await deliver(context, msg, target, "💬 پاسخ ناشناس",
+                          user_markup(token, allow_block=False))
             await msg.reply_text("✅ پیام ارسال شد")
         except TelegramError as e:
             await msg.reply_text(f"❌ خطا در ارسال پاسخ: {e}")
@@ -735,22 +901,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await msg.reply_text("لغو شد.", reply_markup=main_keyboard())
             return
         target = context.user_data.get("anon_target")
-        error = None
-        try:
-            await deliver(context, msg, target, "📩 پیام ناشناس")
-        except TelegramError as e:
-            logger.error("خطا در ارسال پیام ناشناس: %s", e)
-            error = e
-        context.user_data.clear()
-        await report_message(context, msg, uid, target, "📩 پیام ناشناس یک‌طرفه",
-                             delivered=error is None)
-        if error:
-            await msg.reply_text(
-                "❌ ارسال ناموفق بود (گیرنده پیدا نشد یا ربات را بلاک کرده است).",
-                reply_markup=main_keyboard(),
-            )
+        if context.user_data.get("anon_kind") == "reply":
+            label, title = "💬 پاسخ ناشناس", "↩️ پاسخ ناشناس کاربر"
         else:
-            await msg.reply_text("✅ پیام ارسال شد.", reply_markup=main_keyboard())
+            label, title = "📩 پیام ناشناس", "📩 پیام ناشناس یک‌طرفه"
+        await send_anonymous(update, context, target, label, title)
         return
 
     # --- ۵) انتخاب جنسیت ---
@@ -841,6 +996,7 @@ async def post_init(app: Application) -> None:
         BotCommand("stop", "قطع ارتباط"),
         BotCommand("gender", "تغییر جنسیت من"),
         BotCommand("cancel", "انصراف"),
+        BotCommand("unblockall", "خارج کردن همه از لیست بلاک من"),
     ])
 
 
@@ -861,7 +1017,9 @@ def main() -> None:
     app.add_handler(CommandHandler("blocked", cmd_blocked, filters=admin))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast, filters=admin))
 
+    app.add_handler(CommandHandler("unblockall", cmd_unblockall))
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(reply|block|unblock)_\d+$"))
+    app.add_handler(CallbackQueryHandler(on_user_callback, pattern=r"^(ur|ub|uu)_[0-9a-f]{12}$"))
     app.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE
